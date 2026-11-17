@@ -1,0 +1,5 @@
+# Local runtime state - contains real internal server hostnames, generated automatically on first run
+WinCollect_Config.txt
+
+# Plain-text duplicates kept locally for sharing/attachment purposes
+*.txt
