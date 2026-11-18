@@ -114,9 +114,26 @@ $Global:Subscriptions = @{
 # ------------------------------------------------------------------------------
 $ScriptFolder = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
 $Global:ConfigPath = Join-Path $ScriptFolder "WinCollect_Config.txt"
+$Global:BackupsFolder = Join-Path $ScriptFolder "Backups"
+$Global:MaxConfigBackups = 30
+
+# Keeps only the newest $Global:MaxConfigBackups files matching $Pattern in the
+# Backups folder, so backups accumulate without growing forever.
+function Prune-Backups ($Pattern) {
+    $Old = Get-ChildItem -Path $Global:BackupsFolder -Filter $Pattern -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip $Global:MaxConfigBackups
+    foreach ($F in $Old) { Remove-Item $F.FullName -Force -ErrorAction SilentlyContinue }
+}
 
 function Save-Config {
     try {
+        if (Test-Path $Global:ConfigPath) {
+            if (-not (Test-Path $Global:BackupsFolder)) { New-Item -ItemType Directory -Path $Global:BackupsFolder -Force | Out-Null }
+            $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+            Copy-Item $Global:ConfigPath (Join-Path $Global:BackupsFolder "WinCollect_Config_$Stamp.txt") -Force -ErrorAction SilentlyContinue
+            Prune-Backups "WinCollect_Config_*.txt"
+        }
+
         $SubsOut = @{}
         foreach ($Tag in $Global:Subscriptions.Keys) {
             $S = $Global:Subscriptions[$Tag]
@@ -142,8 +159,8 @@ function Save-Config {
         }
         $Config | ConvertTo-Json -Depth 8 | Out-File -FilePath $Global:ConfigPath -Encoding UTF8 -Force
     } catch {
-        if (Get-Variable -Name TxtConsole -Scope Global -ErrorAction SilentlyContinue) {
-            Write-Log "ERROR saving config to '$Global:ConfigPath': $($_.Exception.Message)"
+        if (Get-Command Write-ErrorLog -ErrorAction SilentlyContinue) {
+            Write-ErrorLog "Error saving config to '$Global:ConfigPath':" $_
         }
     }
 }
@@ -152,21 +169,32 @@ function Load-Config {
     if (-not (Test-Path $Global:ConfigPath)) { return $false }
     try {
         $Loaded = Get-Content $Global:ConfigPath -Raw | ConvertFrom-Json
-        if ($Loaded.WinCollect10_Servers) { $Global:WinCollect10_Servers = @($Loaded.WinCollect10_Servers) }
-        if ($Loaded.WinCollect7_Servers)  { $Global:WinCollect7_Servers  = @($Loaded.WinCollect7_Servers) }
-        if ($Loaded.WinCollectServiceName) { $Global:WinCollectServiceName = $Loaded.WinCollectServiceName }
+
+        # Explicit $null checks (not "if ($Loaded.X)") - a legitimately empty
+        # server list is an empty array, which PowerShell treats as falsy in a
+        # plain "if", so a bare truthiness check would silently keep the
+        # hardcoded defaults instead of loading the saved empty list.
+        if ($null -ne $Loaded.WinCollect10_Servers) {
+            $Global:WinCollect10_Servers = @($Loaded.WinCollect10_Servers | Where-Object { $null -ne $_ })
+        }
+        if ($null -ne $Loaded.WinCollect7_Servers) {
+            $Global:WinCollect7_Servers = @($Loaded.WinCollect7_Servers | Where-Object { $null -ne $_ })
+        }
+        if ($null -ne $Loaded.WinCollectServiceName -and $Loaded.WinCollectServiceName -ne '') {
+            $Global:WinCollectServiceName = $Loaded.WinCollectServiceName
+        }
 
         $NewSubs = @{}
         foreach ($Tag in $Loaded.Subscriptions.PSObject.Properties.Name) {
             $S = $Loaded.Subscriptions.$Tag
             $Filters = [System.Collections.ArrayList]@()
-            foreach ($F in @($S.Filters)) {
+            foreach ($F in @($S.Filters | Where-Object { $null -ne $_ })) {
                 [void]$Filters.Add([PSCustomObject]@{ Channel = $F.Channel; EventID = $F.EventID; Action = $F.Action; Note = $F.Note })
             }
             $NewSubs[$Tag] = @{
                 Name                  = $S.Name
                 Mode                  = $S.Mode
-                Channels              = @($S.Channels)
+                Channels              = @($S.Channels | Where-Object { $null -ne $_ })
                 RawXPath              = $S.RawXPath
                 Filters               = $Filters
                 WecId                 = $S.WecId
@@ -185,6 +213,71 @@ function Load-Config {
 }
 
 $Global:ConfigWasLoaded = Load-Config
+
+# ------------------------------------------------------------------------------
+# 2c. TWO-WAY SYNC BETWEEN THE GRANULAR FILTER GRID AND THE RAW XPATH QUERYLIST
+# ------------------------------------------------------------------------------
+# Rebuilds a subscription's RawXPath QueryList from its Filters list (one Query
+# per channel: Include EventIDs narrow the Select, Exclude EventIDs become a
+# Suppress). Called whenever a filter row is added/removed.
+function Build-XPathFromFilters ($Filters) {
+    $Groups = @($Filters) | Group-Object Channel
+    if ($Groups.Count -eq 0) { return "<QueryList>`r`n</QueryList>" }
+
+    $Queries = @()
+    $Id = 0
+    foreach ($Grp in $Groups) {
+        $Channel  = $Grp.Name
+        $Includes = @($Grp.Group | Where-Object { $_.Action -eq 'Include' } | Select-Object -ExpandProperty EventID)
+        $Excludes = @($Grp.Group | Where-Object { $_.Action -eq 'Exclude' } | Select-Object -ExpandProperty EventID)
+
+        if ($Includes.Count -gt 0) {
+            $Cond = ($Includes | ForEach-Object { "EventID=$_" }) -join ' or '
+            $SelectExpr = "*[System[($Cond)]]"
+        } else {
+            $SelectExpr = "*"
+        }
+
+        $SuppressLine = ""
+        if ($Excludes.Count -gt 0) {
+            $Cond = ($Excludes | ForEach-Object { "EventID=$_" }) -join ' or '
+            $SuppressLine = "`r`n    <Suppress Path=`"$Channel`">*[System[($Cond)]]</Suppress>"
+        }
+
+        $Queries += "  <Query Id=`"$Id`" Path=`"$Channel`">`r`n    <Select Path=`"$Channel`">$SelectExpr</Select>$SuppressLine`r`n  </Query>"
+        $Id++
+    }
+    return "<QueryList>`r`n$($Queries -join "`r`n")`r`n</QueryList>"
+}
+
+# Reverse direction: parses a RawXPath QueryList back into Filters rows. Returns
+# $null (and leaves the caller's filters untouched) if the text isn't valid XML
+# yet, e.g. while the user is mid-edit. Per-filter Notes aren't recoverable from
+# raw XPath (it has no concept of a note) so round-tripped rows get a blank Note.
+function Parse-FiltersFromXPath ($XPathText) {
+    if ([string]::IsNullOrWhiteSpace($XPathText)) { return $null }
+    try {
+        [xml]$Xml = $XPathText
+    } catch {
+        return $null
+    }
+    $Filters = [System.Collections.ArrayList]@()
+    foreach ($Query in @($Xml.QueryList.Query)) {
+        foreach ($Select in @($Query.Select)) {
+            $Path = $Select.Path
+            foreach ($Match in [regex]::Matches([string]$Select.InnerText, 'EventID\s*=\s*(\d+)')) {
+                [void]$Filters.Add([PSCustomObject]@{ Channel = $Path; EventID = $Match.Groups[1].Value; Action = 'Include'; Note = '' })
+            }
+        }
+        foreach ($Suppress in @($Query.Suppress)) {
+            $Path = $Suppress.Path
+            foreach ($Match in [regex]::Matches([string]$Suppress.InnerText, 'EventID\s*=\s*(\d+)')) {
+                [void]$Filters.Add([PSCustomObject]@{ Channel = $Path; EventID = $Match.Groups[1].Value; Action = 'Exclude'; Note = '' })
+            }
+        }
+    }
+    return $Filters
+}
 
 # ------------------------------------------------------------------------------
 # 3. LIGHT-MODE WPF XAML LAYOUT
@@ -265,7 +358,6 @@ $Global:ConfigWasLoaded = Load-Config
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="270"/>
                 <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="380"/>
             </Grid.ColumnDefinitions>
 
             <!-- COL 1: SERVERS & RESTART CONTROLS -->
@@ -315,7 +407,7 @@ $Global:ConfigWasLoaded = Load-Config
             </Border>
 
             <!-- COL 2: SUBSCRIPTION & INDEPENDENT FILTER MANAGEMENT -->
-            <Border Grid.Column="1" Background="#FFFFFF" CornerRadius="8" Padding="12" Margin="0,0,8,0" BorderBrush="#E5E7EB" BorderThickness="1">
+            <Border Grid.Column="1" Background="#FFFFFF" CornerRadius="8" Padding="12" BorderBrush="#E5E7EB" BorderThickness="1">
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto"/>
@@ -445,20 +537,6 @@ $Global:ConfigWasLoaded = Load-Config
                     </Grid>
                 </Grid>
             </Border>
-
-            <!-- COL 3: PREVIEW -->
-            <Border Grid.Column="2" Background="#FFFFFF" CornerRadius="8" Padding="10" BorderBrush="#E5E7EB" BorderThickness="1">
-                <Grid>
-                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-                    <Border Grid.Row="0" Style="{StaticResource SectionDivider}">
-                        <TextBlock Text="COMBINED FLEET PAYLOAD PREVIEW" Style="{StaticResource SectionHeader}" Foreground="#4B5563"/>
-                    </Border>
-                    <TextBox x:Name="TxtPreview" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap"
-                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-                             FontFamily="Consolas" FontSize="11" Background="#FAFAFA" Foreground="#1F2937" BorderBrush="#D1D5DB"
-                             ToolTip="Read-only preview of the raw XPath that will be deployed for both subscriptions."/>
-                </Grid>
-            </Border>
         </Grid>
 
         <!-- LOG CONSOLE -->
@@ -469,10 +547,32 @@ $Global:ConfigWasLoaded = Load-Config
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <Border Grid.Row="0" Style="{StaticResource SectionDivider}" Margin="0,0,0,4">
-                    <TextBlock Text="ACTIVITY LOG" Style="{StaticResource SectionHeader}" Foreground="#4B5563"/>
+                    <TextBlock Text="ACTIVITY LOG (double-click a red error line for full details)" Style="{StaticResource SectionHeader}" Foreground="#4B5563"/>
                 </Border>
-                <TextBox x:Name="TxtConsole" Grid.Row="1" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
-                         FontFamily="Consolas" FontSize="11" Background="Transparent" Foreground="#374151" BorderThickness="0"/>
+                <ListBox x:Name="LstConsole" Grid.Row="1" BorderThickness="0" Background="Transparent"
+                         ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         FontFamily="Consolas" FontSize="11">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Display}" TextWrapping="Wrap"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="Foreground" Value="#374151"/>
+                            <Setter Property="Padding" Value="2,1"/>
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsError}" Value="True">
+                                    <Setter Property="Foreground" Value="#DC2626"/>
+                                    <Setter Property="FontWeight" Value="SemiBold"/>
+                                    <Setter Property="Cursor" Value="Hand"/>
+                                    <Setter Property="ToolTip" Value="Double-click for the full error details and likely cause."/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                </ListBox>
             </Grid>
         </Border>
     </Grid>
@@ -512,8 +612,7 @@ $TxtFilterNote   = $Window.FindName("TxtFilterNote")
 $BtnAddFilter    = $Window.FindName("BtnAddFilter")
 $BtnRemoveFilter = $Window.FindName("BtnRemoveFilter")
 
-$TxtPreview      = $Window.FindName("TxtPreview")
-$TxtConsole      = $Window.FindName("TxtConsole")
+$LstConsole      = $Window.FindName("LstConsole")
 $TxtServiceName  = $Window.FindName("TxtServiceName")
 $BtnSyncWC10     = $Window.FindName("BtnSyncWC10")
 $BtnSyncWC7      = $Window.FindName("BtnSyncWC7")
@@ -522,10 +621,75 @@ $BtnDeployWec    = $Window.FindName("BtnDeployWec")
 
 $TxtServiceName.Text = $Global:WinCollectServiceName
 
-function Write-Log ($Msg) {
-    $TxtConsole.AppendText("[$(Get-Date -Format 'HH:mm:ss')] $Msg`r`n")
-    $TxtConsole.ScrollToEnd()
+# Full log history, including the error Details text that isn't shown inline.
+$Global:LogEntries = [System.Collections.ArrayList]@()
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Msg,
+        [string]$Details = "",
+        [switch]$IsError
+    )
+    $Entry = [PSCustomObject]@{
+        Time    = Get-Date -Format 'HH:mm:ss'
+        Message = $Msg
+        Details = $Details
+        IsError = [bool]$IsError
+        Display = "[$(Get-Date -Format 'HH:mm:ss')] $Msg"
+    }
+    [void]$Global:LogEntries.Add($Entry)
+    [void]$LstConsole.Items.Add($Entry)
+    $LstConsole.ScrollIntoView($Entry)
 }
+
+# Pattern-matches common remote-ops failures to a plain-English likely cause,
+# so clicking an error tells you where to look instead of just repeating the
+# exception text.
+function Get-ErrorHint ($ExceptionMessage) {
+    switch -Regex ($ExceptionMessage) {
+        'Access is denied'                                   { return "Access denied - verify the account running this tool has local admin rights on the target machine and permission on the share/service." }
+        'RPC server is unavailable'                          { return "RPC unreachable - check the target is online, the firewall allows RPC (for Get-Service/Restart-Service), and try again." }
+        'WinRM (client|cannot complete the operation)'       { return "WinRM unreachable - verify the WinRM service is running on the target and this host is allowed to connect (Enable-PSRemoting / firewall / trusted hosts)." }
+        'network path was not found'                         { return "Network path not found - verify the hostname/DNS resolution and that the admin share (C`$) is reachable from this machine." }
+        '(Cannot find path|does not exist)'                  { return "Path not found on the target - verify WinCollect is installed at the expected location on that server." }
+        'cannot be found on the system|service .* was not found' { return "Service not found - check the Service Name field matches the actual WinCollect service name on that machine." }
+        'wecutil'                                             { return "wecutil failed on the remote machine - re-run 'wecutil cs/us' manually on that server to see the full native error text." }
+        default                                               { return $null }
+    }
+}
+
+# Logs an error with full exception detail + a likely-cause hint, so the
+# activity log line can stay short while "double-click for details" surfaces
+# everything needed to actually fix it.
+function Write-ErrorLog ($Context, $ErrorRecord) {
+    $ExMsg = $ErrorRecord.Exception.Message
+    $Hint  = Get-ErrorHint $ExMsg
+    $DetailLines = @(
+        "Context: $Context"
+        "Exception Type: $($ErrorRecord.Exception.GetType().FullName)"
+        "Message: $ExMsg"
+    )
+    if ($ErrorRecord.Exception.InnerException) {
+        $DetailLines += "Inner Exception: $($ErrorRecord.Exception.InnerException.Message)"
+    }
+    if ($Hint) {
+        $DetailLines += ""
+        $DetailLines += "Likely cause / fix: $Hint"
+    }
+    if ($ErrorRecord.ScriptStackTrace) {
+        $DetailLines += ""
+        $DetailLines += "Script location:"
+        $DetailLines += $ErrorRecord.ScriptStackTrace
+    }
+    Write-Log -Msg "$Context $ExMsg" -Details ($DetailLines -join "`r`n") -IsError
+}
+
+$LstConsole.Add_MouseDoubleClick({
+    $Sel = $LstConsole.SelectedItem
+    if ($Sel -and $Sel.IsError) {
+        [System.Windows.MessageBox]::Show($Sel.Details, "Error Details", "OK", "Error")
+    }
+})
 
 function Get-ServiceName {
     $Name = $TxtServiceName.Text.Trim()
@@ -586,8 +750,6 @@ function Update-View {
     Set-ComboByContent $CmbSubType $(if ($Sub.SubscriptionType -eq "CollectorInitiated") { "Collector Initiated" } else { "Source Computer Initiated" })
     if ($TxtComputerGroup.IsFocused -eq $false) { $TxtComputerGroup.Text = $Sub.ComputerGroup }
     if ($TxtDestinationLog.IsFocused -eq $false) { $TxtDestinationLog.Text = $Sub.DestinationLog }
-
-    $TxtPreview.Text = "=== SUB 1 ===`r`n$($Global:Subscriptions['Sub1'].RawXPath)`r`n`r`n=== SUB 2 ===`r`n$($Global:Subscriptions['Sub2'].RawXPath)"
 }
 
 $CmbSubscription.Add_SelectionChanged({ Update-View })
@@ -595,6 +757,16 @@ $TxtRawXPath.Add_TextChanged({
     $Tag = ($CmbSubscription.SelectedItem).Tag
     if ($Global:Subscriptions[$Tag]) {
         $Global:Subscriptions[$Tag].RawXPath = $TxtRawXPath.Text
+
+        # Keep the Filters grid in sync with manual XPath edits. Parsing fails
+        # (returns $null) while the XML is mid-edit/invalid - in that case leave
+        # the existing filter rows alone rather than wiping them out.
+        $ParsedFilters = Parse-FiltersFromXPath $TxtRawXPath.Text
+        if ($null -ne $ParsedFilters) {
+            $Global:Subscriptions[$Tag].Filters = $ParsedFilters
+            $GridFilters.ItemsSource = $null
+            $GridFilters.ItemsSource = $Global:Subscriptions[$Tag].Filters
+        }
         Save-Config
     }
 })
@@ -645,7 +817,19 @@ $BtnAddWC10.Add_Click({
     Write-Log "Added '$NewSrv' to WC10 server list."
     Save-Config
 })
-$BtnRemWC10.Add_Click({ if ($ListWC10.SelectedItem) { $Removed = $ListWC10.SelectedItem; $Global:WinCollect10_Servers = $Global:WinCollect10_Servers | ? { $_ -ne $Removed }; Refresh-Lists; Write-Log "Removed '$Removed' from WC10 server list."; Save-Config } })
+$BtnRemWC10.Add_Click({
+    if ($ListWC10.SelectedItem) {
+        $Removed = $ListWC10.SelectedItem
+        # @(...) around the whole pipeline (not around a bare $null) is required -
+        # without it, removing the last remaining server leaves this $null instead
+        # of an empty array, which Save-Config/Load-Config then silently drop and
+        # the hardcoded defaults come back on next launch.
+        $Global:WinCollect10_Servers = @($Global:WinCollect10_Servers | Where-Object { $_ -ne $Removed })
+        Refresh-Lists
+        Write-Log "Removed '$Removed' from WC10 server list."
+        Save-Config
+    }
+})
 
 $BtnAddWC7.Add_Click({
     $NewSrv = $TxtNewWC7.Text.Trim()
@@ -658,7 +842,15 @@ $BtnAddWC7.Add_Click({
     Write-Log "Added '$NewSrv' to WC7 server list."
     Save-Config
 })
-$BtnRemWC7.Add_Click({ if ($ListWC7.SelectedItem) { $Removed = $ListWC7.SelectedItem; $Global:WinCollect7_Servers = $Global:WinCollect7_Servers | ? { $_ -ne $Removed }; Refresh-Lists; Write-Log "Removed '$Removed' from WC7 server list."; Save-Config } })
+$BtnRemWC7.Add_Click({
+    if ($ListWC7.SelectedItem) {
+        $Removed = $ListWC7.SelectedItem
+        $Global:WinCollect7_Servers = @($Global:WinCollect7_Servers | Where-Object { $_ -ne $Removed })
+        Refresh-Lists
+        Write-Log "Removed '$Removed' from WC7 server list."
+        Save-Config
+    }
+})
 
 # Restart Service Handlers
 $BtnRestartWC10.Add_Click({
@@ -676,7 +868,7 @@ $BtnRestartWC10.Add_Click({
         Restart-RemoteService -ComputerName $target -ServiceName $SvcName
         Write-Log "[$target] '$SvcName' service restarted successfully."
     } catch {
-        Write-Log "[$target] ERROR restarting service: $($_.Exception.Message)"
+        Write-ErrorLog "[$target] Error restarting service:" $_
     } finally {
         $Window.Cursor = [System.Windows.Input.Cursors]::Arrow
     }
@@ -697,7 +889,7 @@ $BtnRestartWC7.Add_Click({
         Restart-RemoteService -ComputerName $target -ServiceName $SvcName
         Write-Log "[$target] '$SvcName' service restarted successfully."
     } catch {
-        Write-Log "[$target] ERROR restarting service: $($_.Exception.Message)"
+        Write-ErrorLog "[$target] Error restarting service:" $_
     } finally {
         $Window.Cursor = [System.Windows.Input.Cursors]::Arrow
     }
@@ -713,6 +905,7 @@ $BtnAddFilter.Add_Click({
 
     if ($Ch -and $Eid -match '^\d+$') {
         [void]$Sub.Filters.Add([PSCustomObject]@{ Channel = $Ch; EventID = $Eid; Action = $Act; Note = $Note })
+        $Sub.RawXPath = Build-XPathFromFilters $Sub.Filters
         $CmbFilterChannel.Text = ""; $TxtFilterEventID.Clear(); $TxtFilterNote.Clear()
         Update-View
         Write-Log "Added filter: $Ch / EventID $Eid ($Act)."
@@ -724,8 +917,10 @@ $BtnAddFilter.Add_Click({
 
 $BtnRemoveFilter.Add_Click({
     $Tag = ($CmbSubscription.SelectedItem).Tag
+    $Sub = $Global:Subscriptions[$Tag]
     if ($GridFilters.SelectedItem) {
-        $Global:Subscriptions[$Tag].Filters.Remove($GridFilters.SelectedItem)
+        $Sub.Filters.Remove($GridFilters.SelectedItem)
+        $Sub.RawXPath = Build-XPathFromFilters $Sub.Filters
         Update-View
         Save-Config
     }
@@ -747,11 +942,16 @@ function Deploy-WC10 {
     $Tmp = "$env:TEMP\update_wc10.xml"
     $Patch | Out-File $Tmp -Encoding UTF8 -Force
 
+    $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     foreach ($s in $Global:WinCollect10_Servers) {
+        $Dest = "\\$s\C$\Program Files\IBM\WinCollect\patch\update_sync.xml"
         try {
-            Copy-Item $Tmp "\\$s\C$\Program Files\IBM\WinCollect\patch\update_sync.xml" -Force -ErrorAction Stop
+            if (Test-Path $Dest) {
+                Copy-Item $Dest "$Dest.bak_$Stamp" -Force -ErrorAction SilentlyContinue
+            }
+            Copy-Item $Tmp $Dest -Force -ErrorAction Stop
             Write-Log "[$s] WC10 patch deployed successfully."
-        } catch { Write-Log "[$s] ERROR deploying patch: $($_.Exception.Message)" }
+        } catch { Write-ErrorLog "[$s] Error deploying patch:" $_ }
     }
 }
 
@@ -759,11 +959,14 @@ function Deploy-WC7 {
     $XPath1 = $Global:Subscriptions['Sub1'].RawXPath
     $XPath2 = $Global:Subscriptions['Sub2'].RawXPath
     $SvcName = Get-ServiceName
+    $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
     foreach ($s in $Global:WinCollect7_Servers) {
         $Path = "\\$s\C$\Program Files\IBM\WinCollect\config\AgentConfig.xml"
         try {
-            Copy-Item $Path "$Path.bak" -Force -ErrorAction Stop
+            # Timestamped backup (instead of a single rolling ".bak") so every past
+            # deployment stays recoverable, not just the one immediately prior.
+            Copy-Item $Path "$Path.bak_$Stamp" -Force -ErrorAction Stop
             [xml]$Xml = Get-Content $Path -Raw
             $Svcs = $Xml.SelectNodes("//Service[@classification='Service' and contains(@type, 'EventLog')]")
             if ($Svcs.Count -ge 2) {
@@ -771,11 +974,11 @@ function Deploy-WC7 {
                 $Svcs[1].SelectSingleNode("Parameter[@name='XPathQuery']").SetAttribute("value", $XPath2)
                 $Xml.Save($Path)
                 Restart-RemoteService -ComputerName $s -ServiceName $SvcName
-                Write-Log "[$s] WC7 configuration merged and '$SvcName' service restarted."
+                Write-Log "[$s] WC7 configuration merged and '$SvcName' service restarted. Backup saved as '$Path.bak_$Stamp'."
             } else {
-                Write-Log "[$s] ERROR: expected 2 EventLog services in AgentConfig.xml, found $($Svcs.Count). Skipped."
+                Write-Log -Msg "[$s] ERROR: expected 2 EventLog services in AgentConfig.xml, found $($Svcs.Count). Skipped." -IsError -Details "Context: [$s] Deploy-WC7`r`nAgentConfig.xml at '$Path' does not contain the expected 2 EventLog Service nodes (found $($Svcs.Count)).`r`n`r`nLikely cause / fix: the WC7 AgentConfig.xml on this server has a different number/order of EventLog sources than Sub1/Sub2 expect - open the file on the server and confirm its Service nodes match what this tool assumes."
             }
-        } catch { Write-Log "[$s] ERROR: $($_.Exception.Message)" }
+        } catch { Write-ErrorLog "[$s] Error merging AgentConfig.xml:" $_ }
     }
 }
 
@@ -793,12 +996,14 @@ function Get-WecDeliverySettings ($Mode) {
 
 function Get-ComputerGroupSddl ($GroupName) {
     if ($GroupName.Trim() -eq "Domain Computers") {
-        # Matches the SDDL wecutil itself emits when "Domain Computers" is picked in the wizard.
-        return "O:NSG:NSD:(A;;GA;;;DC)(A;;GA;;;NS)"
+        # "DC" = Domain Computers. Only the configured group is granted - no extra
+        # principals (e.g. NETWORK SERVICE) are added so the subscription's allowed
+        # source list matches exactly what was typed in the UI.
+        return "O:NSG:NSD:(A;;GA;;;DC)"
     }
     try {
         $Sid = (New-Object System.Security.Principal.NTAccount($GroupName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        return "O:NSG:NSD:(A;;GA;;;$Sid)(A;;GA;;;NS)"
+        return "O:NSG:NSD:(A;;GA;;;$Sid)"
     } catch {
         throw "Could not resolve computer group '$GroupName' to a SID: $($_.Exception.Message)"
     }
@@ -836,24 +1041,38 @@ function New-WecSubscriptionXml ($Sub) {
 }
 
 function Deploy-WecSubscription ($ComputerName, $XmlContent, $SubId) {
-    Invoke-Command -ComputerName $ComputerName -ErrorAction Stop -ScriptBlock {
+    $PreviousConfig = Invoke-Command -ComputerName $ComputerName -ErrorAction Stop -ScriptBlock {
         param($Content, $Id)
         $TmpPath = Join-Path $env:TEMP "$Id.xml"
         Set-Content -Path $TmpPath -Value $Content -Encoding UTF8 -Force
+        $Previous = $null
         try {
             $Existing = (wecutil es) 2>$null
             if ($Existing -contains $Id) {
-                wecutil us $Id "/c:$TmpPath"
-            } else {
-                wecutil cs $TmpPath
+                # "wecutil us" rejects several property changes (query, delivery mode,
+                # computer group, etc.) on an existing subscription with a generic
+                # "parameter is incorrect" error - the only reliable way to apply an
+                # update is to delete and recreate it, same as the manual workaround.
+                $Previous = (wecutil gc $Id 2>&1) -join "`r`n"
+                $null = wecutil ds $Id 2>&1
             }
+            $CreateOutput = wecutil cs $TmpPath 2>&1
             if ($LASTEXITCODE -ne 0) {
-                throw "wecutil exited with code $LASTEXITCODE"
+                throw "wecutil cs exited with code $LASTEXITCODE`: $($CreateOutput -join ' ')"
             }
         } finally {
             Remove-Item $TmpPath -Force -ErrorAction SilentlyContinue
         }
+        return $Previous
     } -ArgumentList $XmlContent, $SubId
+
+    if ($PreviousConfig) {
+        if (-not (Test-Path $Global:BackupsFolder)) { New-Item -ItemType Directory -Path $Global:BackupsFolder -Force | Out-Null }
+        $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $BackupFile = Join-Path $Global:BackupsFolder "WEC_${ComputerName}_${SubId}_$Stamp.txt"
+        $PreviousConfig | Out-File -FilePath $BackupFile -Encoding UTF8 -Force
+        Prune-Backups "WEC_${ComputerName}_${SubId}_*.txt"
+    }
 }
 
 function Deploy-WecSubscriptions {
@@ -867,7 +1086,7 @@ function Deploy-WecSubscriptions {
         try {
             $XmlContent = New-WecSubscriptionXml $Sub
         } catch {
-            Write-Log "ERROR building WEC subscription XML for '$($Sub.WecId)': $($_.Exception.Message)"
+            Write-ErrorLog "Error building WEC subscription XML for '$($Sub.WecId)':" $_
             continue
         }
         foreach ($s in $AllTargets) {
@@ -875,7 +1094,7 @@ function Deploy-WecSubscriptions {
                 Deploy-WecSubscription -ComputerName $s -XmlContent $XmlContent -SubId $Sub.WecId
                 Write-Log "[$s] WEC subscription '$($Sub.WecId)' deployed ($($Sub.SubscriptionType), $($Sub.Protocol), $($Sub.DeliveryOptimization))."
             } catch {
-                Write-Log "[$s] ERROR deploying WEC subscription '$($Sub.WecId)': $($_.Exception.Message)"
+                Write-ErrorLog "[$s] Error deploying WEC subscription '$($Sub.WecId)':" $_
             }
         }
     }

@@ -102,12 +102,10 @@ list, and (if you use WEC) the native collector subscription properties.
    selected; switching is non-destructive, nothing is lost.
 2. **Edit the raw XPath** — the **Raw XPath Configuration** box is a direct
    editor for the subscription's `<QueryList>`. This is the actual query that
-   gets deployed. You can hand-edit it directly, or let the granular filter
-   list (§7) build it for you conceptually — note the raw box is *not*
-   auto-generated from the filter grid; they're tracked independently, so if
-   you add filters in the grid, also reflect the equivalent `<Suppress>`/
-   `<Select>` clause in the raw XPath if you want it to actually take effect
-   on deployment.
+   gets deployed. It is kept in sync both ways with the granular filter grid
+   (§7): editing the raw XPath rebuilds the filter rows, and adding/removing a
+   filter row rebuilds the raw XPath. You can use either one as your primary
+   editor.
 3. **Set the WEC subscription settings** (only relevant if you use
    `Deploy WEC Subscriptions`) — in the **WEC Subscription Settings** panel:
    - **Delivery Optimization**: `Normal` (15 min batching), `Minimize Latency`
@@ -122,10 +120,7 @@ list, and (if you use WEC) the native collector subscription properties.
      resolved to a SID automatically when you deploy.
    - **Destination Log**: the local log on the collector where forwarded
      events land (default `ForwardedEvents`).
-4. **Preview before deploying** — column 3, **Combined Fleet Payload Preview**,
-   always shows both subscriptions' raw XPath side by side, regardless of
-   which one is selected in the dropdown. Use it as a final sanity check.
-5. **Deploy**:
+4. **Deploy**:
    - `Deploy to WC10` / `Deploy to WC7` push the raw XPath only (IBM WinCollect
      config).
    - `Deploy WEC Subscriptions` pushes the raw XPath **and** the WEC settings
@@ -164,11 +159,12 @@ subscription captures.
    - Click **`+ Add Filter`**. Validation blocks you if Channel is empty or
      Event ID isn't numeric.
 4. **To remove a filter**: click the row in the grid, then **`Remove Selected`**.
-5. **Important**: the filter grid is a *tracking list*, not the live query —
-   adding a row here does not automatically rewrite the Raw XPath box. If the
-   filter needs to actually suppress/select events on deployment, also add the
-   matching `<Suppress>` or restrict the `<Select>` clause in the **Raw XPath
-   Configuration** box for that channel/EventID. Keep the two in sync manually.
+5. The grid and the **Raw XPath Configuration** box are the same underlying
+   query, kept in sync automatically: adding/removing a filter row rewrites the
+   raw XPath, and editing the raw XPath directly re-parses it back into filter
+   rows. The one thing that doesn't round-trip is the **Note** column — raw
+   XPath has no concept of a note, so a filter added by hand-editing the XPath
+   gets a blank note.
 6. Every add/remove is saved immediately to `WinCollect_Config.txt` (§9) and
    logged in the Activity Log — but is **not** deployed to any server until you
    click one of the Deploy buttons.
@@ -181,6 +177,11 @@ Every action — adding/removing a server, adding/removing a filter, restarting 
 service, each per-server deploy result — is timestamped and appended here.
 Scroll up to review what happened in this session; it's not persisted to disk
 (only the configuration itself is — see §9), so it resets each time you relaunch.
+
+Error lines are shown in **red**. **Double-click a red line** to open a details
+popup with the full exception message, the underlying cause (e.g. the raw
+`wecutil` output on a WEC failure), a plain-English likely cause/fix, and the
+script location — instead of just the one-line summary shown inline.
 
 ---
 
@@ -197,28 +198,45 @@ Scroll up to review what happened in this session; it's not persisted to disk
 - **Read automatically** on startup, before the window even opens. The
   Activity Log's first line tells you whether it loaded a saved config or fell
   back to the script's hard-coded defaults.
+- An empty list (e.g. you removed every WC7 server) is saved and restored as
+  an empty list, not silently replaced by the defaults on next launch.
 - If you want to reset everything back to the original built-in defaults,
   close the GUI and delete `WinCollect_Config.txt`, then relaunch.
+- **Backups**: every time the config is saved, the previous
+  `WinCollect_Config.txt` is copied into a `Backups\` folder next to the
+  script before being overwritten (timestamped, newest 30 kept). Deployments
+  are backed up too (see §10) so a bad push can be rolled back.
 
 ---
 
 ## 10. How each Deploy button actually works
 
 - **`Deploy to WC10`**: builds a `WinCollectScript` patch XML with both
-  subscriptions' XPath embedded, writes it to a local temp file, then copies it
-  to `\\<server>\C$\Program Files\IBM\WinCollect\patch\update_sync.xml` on every
-  WC10 server. WinCollect itself picks up and applies the patch on its own.
-- **`Deploy to WC7`**: backs up `AgentConfig.xml` to `.bak` on the target, loads
-  it, finds the two `EventLog`-classified `Service` nodes, overwrites their
-  `XPathQuery` parameter with Sub1/Sub2's raw XPath respectively, saves it back
-  over SMB, then restarts the configured service (§5) on that server.
+  subscriptions' XPath embedded, writes it to a local temp file. If an
+  `update_sync.xml` already exists on the target, it's first copied to
+  `update_sync.xml.bak_<timestamp>` next to it, then the new patch is copied to
+  `\\<server>\C$\Program Files\IBM\WinCollect\patch\update_sync.xml`. WinCollect
+  itself picks up and applies the patch on its own.
+- **`Deploy to WC7`**: backs up `AgentConfig.xml` to `AgentConfig.xml.bak_<timestamp>`
+  on the target (every deploy gets its own timestamped backup, not just a
+  single rolling `.bak`), loads it, finds the two `EventLog`-classified
+  `Service` nodes, overwrites their `XPathQuery` parameter with Sub1/Sub2's raw
+  XPath respectively, saves it back over SMB, then restarts the configured
+  service (§5) on that server.
 - **`Deploy WEC Subscriptions`**: for each subscription, builds a real
   `<Subscription>` XML (the same schema `wecutil gs ... /f:xml` would show),
   mapping the WEC settings panel to actual `Delivery`/`TransportName`/`LogFile`/
-  `AllowedSourceDomainComputers` elements, then uses `Invoke-Command` (WinRM) to
-  run `wecutil cs` (create) or `wecutil us` (update, if the subscription ID
-  already exists) directly on each WC10+WC7 server. `wecutil` has no remote
-  switch of its own, which is why PowerShell remoting is required for this one.
+  `AllowedSourceDomainComputers` elements. `AllowedSourceDomainComputers` only
+  grants the group you typed in **Included Computer Group** — no extra
+  principals are added. Then it uses `Invoke-Command` (WinRM) to deploy on each
+  WC10+WC7 server: if the subscription ID doesn't exist yet it runs `wecutil
+  cs` (create); if it already exists, the previous definition is captured
+  (`wecutil gc`, saved to `Backups\`) and the subscription is deleted and
+  recreated (`wecutil ds` + `wecutil cs`) rather than using `wecutil us`, which
+  rejects many property changes (query, delivery mode, computer group) on an
+  existing subscription with a generic "parameter is incorrect" error.
+  `wecutil` has no remote switch of its own, which is why PowerShell remoting
+  is required for this one.
 - **Restart Service buttons / WC7 auto-restart**: `Restart-Service` has no
   `-ComputerName` parameter in Windows PowerShell, so the tool binds a
   `ServiceController` to the remote machine via `Get-Service -ComputerName`
@@ -229,12 +247,16 @@ Scroll up to review what happened in this session; it's not persisted to disk
 
 ## 11. Troubleshooting
 
+Double-click any red error line in the Activity Log for the full exception,
+likely cause, and (for `wecutil` failures) the actual command output - the
+table below is a quick summary of the same hints.
+
 | Symptom in Activity Log | Likely cause |
 |---|---|
-| `ERROR restarting service: ... Access is denied` | Your account lacks remote service control rights, or the "Remote Service Management" firewall rule isn't enabled on the target. |
-| `ERROR deploying patch: ...` (WC10) | Can't reach `\\server\C$\...` — check the admin share, firewall, and that the WinCollect install path matches. |
+| `Error restarting service: ... Access is denied` | Your account lacks remote service control rights, or the "Remote Service Management" firewall rule isn't enabled on the target. |
+| `Error deploying patch: ...` (WC10) | Can't reach `\\server\C$\...` — check the admin share, firewall, and that the WinCollect install path matches. |
 | `ERROR: expected 2 EventLog services in AgentConfig.xml, found N` (WC7) | That server's `AgentConfig.xml` doesn't have the two EventLog services the tool expects — check the file manually. |
-| `ERROR deploying WEC subscription ...` mentioning WinRM | PowerShell remoting isn't enabled on that target — run `Enable-PSRemoting -Force` there. |
+| `Error deploying WEC subscription ...` mentioning WinRM | PowerShell remoting isn't enabled on that target — run `Enable-PSRemoting -Force` there. |
 | `Could not resolve computer group '...' to a SID` | The Included Computer Group name doesn't exist in AD (or isn't resolvable from the machine running the GUI) — check spelling. |
 
 ---
@@ -245,4 +267,7 @@ Scroll up to review what happened in this session; it's not persisted to disk
 - `WinCollect_Config.txt` — your saved state (server lists, subscriptions,
   filters, WEC settings). Created automatically on first change; safe to
   delete to reset to defaults.
+- `Backups\` — timestamped config and WEC-subscription backups, created
+  automatically (see §9/§10). Safe to prune manually; the tool itself keeps
+  only the newest 30 of each.
 - `README.md` — this file.
